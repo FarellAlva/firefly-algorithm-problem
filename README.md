@@ -2,6 +2,9 @@
 
 **Bio-Inspired Computing | Single-Machine Scheduling Problem (Anti-Overlap & Anti-Keterlambatan) | Pure Python + Tkinter**
 
+![Preview Aplikasi Tkinter — Gantt Chart & Visualisasi Firefly Algorithm](assets/fig5_tkinter_tab1_optimal.png)
+*Preview aplikasi desktop Tkinter (Tab 1): Gantt Chart jadwal optimal 4 tugas tanpa overlap & tepat deadline, peta 2D kawanan kunang-kunang (Base Position, Steps, panah Attractiveness), grafik konvergensi, dan panel kontrol parameter real-time.*
+
 > **Ringkasan Eksekutif**  
 > Proyek ini menyajikan perancangan, implementasi, dan analisis sensitivitas parameter algoritma metaheuristik *bio-inspired computing*—**Firefly Algorithm (FA)**—pada permasalahan penjadwalan 4 tugas produksi pada 1 mesin (*Single-Machine Scheduling Problem*) dalam jam kerja **08:00 s.d. 17:00** (9,0 jam operasional untuk total beban kerja 7,5 jam). Setiap kunang-kunang (*firefly*) merepresentasikan satu calon jadwal secara langsung sebagai vektor posisi kontinu 4 dimensi $x_i = [t_1, t_2, t_3, t_4]$ yang menyatakan jam mulai aktual tiap tugas, dengan tujuan meminimalkan penalti gabungan dari tumpang tindih waktu mesin (*overlap*) dan keterlambatan terhadap tenggat waktu (*lateness*) menuju **0,00** (kecerahan maksimum $I = 1,0000$).  
 >  
@@ -176,15 +179,12 @@ Pengujian dilakukan sebanyak **30 independent runs** (`seed = 100..129`, 50 iter
 
 Aplikasi `app_tkinter.py` menyediakan 3 tab utama yang memudahkan simulasi langsung sekaligus penjelasan konsep langkah demi langkah:
 
-1. **Tab 1 — Gantt Chart & Visualisasi Firefly**: menampilkan pergeseran balok tugas `T1`–`T4` secara real-time, kanvas 2D kawanan kunang-kunang, dan grafik konvergensi.
+1. **Tab 1 — Gantt Chart & Visualisasi Firefly** *(lihat preview utama di bagian paling atas)*: menampilkan pergeseran balok tugas `T1`–`T4` secara real-time, kanvas 2D kawanan kunang-kunang, dan grafik konvergensi.
 2. **Tab 2 — Bedah Base Position, Attractiveness & Steps**: membandingkan jam mulai awal ($t=0$) vs. jam mulai saat ini, serta tabel rinci $r$, $\beta$, Step Tarikan, Step Acak, dan perubahan penalti di tiap iterasi.
 3. **Tab 3 — Panduan Konsep & Efek Parameter**: ringkasan rumus dan panduan demonstrasi.
 
-![Tangkapan Layar Tkinter Tab 1 — Gantt Chart Optimal](assets/fig5_tkinter_tab1_optimal.png)
-*Gambar 5. Tangkapan layar aplikasi Tkinter (Tab 1): Gantt Chart jadwal optimal 4 tugas, peta 2D kawanan Firefly, grafik konvergensi, dan panel kontrol parameter.*
-
 ![Tangkapan Layar Tkinter Tab 2 — Bedah Base Position, Attractiveness & Steps](assets/fig6_tkinter_tab2_inspect.png)
-*Gambar 6. Tangkapan layar aplikasi Tkinter (Tab 2): Bedah transparan Base Position vs. Current Position serta log Attractiveness ($\beta$) dan Steps ($\Delta x$) pada iterasi terakhir.*
+*Gambar 5. Tangkapan layar aplikasi Tkinter (Tab 2): Bedah transparan Base Position vs. Current Position serta log Attractiveness ($\beta$) dan Steps ($\Delta x$) pada iterasi terakhir.*
 
 ---
 
