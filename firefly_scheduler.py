@@ -15,10 +15,10 @@ Konsep inti yang dimodelkan:
    beta(r) = beta0 * exp(-gamma * r^2)
    Dengan r = ||x_i - x_j|| / sqrt(D) adalah jarak Euclidean ternormalisasi di [0, 1].
 4. Steps / Movement (Delta x):
-   x_i_new = x_i + beta(r) * (x_j - x_i) + alpha * (rand - 0.5)
+   x_i_new = x_i + beta(r) * (x_j - x_i) + alpha * epsilon_i
    Terdiri dari:
    - Attraction step : tarikan menuju kunang-kunang yang lebih terang (eksploitasi)
-   - Random step     : langkah acak terkendali oleh alpha (eksplorasi)
+   - Random step     : langkah acak jarang (sparse) terkendali oleh alpha (eksplorasi)
 """
 
 from __future__ import annotations
@@ -74,6 +74,7 @@ class MovementRecord:
     iteration: int
     mover_id: int
     attractor_id: int
+    is_self_exploration: bool
     mover_brightness_before: float
     attractor_brightness: float
     distance_r: float
@@ -90,12 +91,15 @@ class Firefly:
     id: int
     base_position: List[float]  # posisi awal (iterasi 0)
     position: List[float]       # posisi saat ini
-    prev_position: List[float]  # posisi pada iterasi sebelumnya
+    prev_position: List[float]  # posisi sebelum step terakhir
     penalty: int = 0
     brightness: float = 0.0
     report: Optional[ConflictReport] = None
     last_attractor_id: Optional[int] = None
+    last_distance_r: float = 0.0
     last_beta: float = 0.0
+    last_attract_mag: float = 0.0
+    last_random_mag: float = 0.0
     last_step_mag: float = 0.0
     trail_2d: List[Tuple[float, float]] = field(default_factory=list)
 
@@ -191,7 +195,7 @@ class SchedulingProblem:
                 )
 
         room_conflicts = 0
-        for (slot_idx, room_idx), c_indices in room_slot_map.items():
+        for (_slot_idx, room_idx), c_indices in room_slot_map.items():
             if len(c_indices) > 1:
                 room_conflicts += len(c_indices) - 1
                 for ci in c_indices:
@@ -235,11 +239,11 @@ class FireflyScheduler:
     def __init__(
         self,
         problem: Optional[SchedulingProblem] = None,
-        n_fireflies: int = 20,
+        n_fireflies: int = 25,
         beta0: float = 1.0,
-        gamma: float = 1.2,
-        alpha: float = 0.28,
-        alpha_decay: float = 0.97,
+        gamma: float = 1.5,
+        alpha: float = 0.60,
+        alpha_decay: float = 0.985,
         seed: int = 42,
     ) -> None:
         self.problem = problem or SchedulingProblem()
@@ -256,7 +260,7 @@ class FireflyScheduler:
         self.fireflies: List[Firefly] = []
         self.best_firefly: Optional[Firefly] = None
 
-        # Riwayat untuk grafik konvergensi dan inspeksi
+        # Riwayat statistik per iterasi
         self.best_penalty_history: List[int] = []
         self.avg_penalty_history: List[float] = []
         self.avg_beta_history: List[float] = []
@@ -267,7 +271,7 @@ class FireflyScheduler:
 
     def project_2d(self, position: List[float]) -> Tuple[float, float]:
         """
-        Proyeksi deterministik 2D dari vektor 2M-dimensi untuk visualisasi di Canvas:
+        Proyeksi deterministik 2D dari vektor 2M-dimensi untuk visualisasi Canvas:
         - Sumbu X: rata-rata koordinat slot waktu (indeks genap)
         - Sumbu Y: rata-rata koordinat ruangan (indeks ganjil)
         """
@@ -275,9 +279,14 @@ class FireflyScheduler:
         ys = position[1::2]
         return (sum(xs) / len(xs), sum(ys) / len(ys))
 
-    def _normalized_distance(self, pos_a: List[float], pos_b: List[float]) -> float:
+    @staticmethod
+    def normalized_distance(pos_a: List[float], pos_b: List[float]) -> float:
         sq = sum((a - b) ** 2 for a, b in zip(pos_a, pos_b))
         return math.sqrt(sq / len(pos_a))
+
+    def compute_attractiveness(self, r: float) -> float:
+        """Rumus Attractiveness Firefly Algorithm: beta(r) = beta0 * exp(-gamma * r^2)."""
+        return self.beta0 * math.exp(-self.gamma * (r ** 2))
 
     def _evaluate_firefly(self, ff: Firefly) -> None:
         report = self.problem.evaluate(ff.position)
@@ -286,12 +295,13 @@ class FireflyScheduler:
         ff.brightness = self.problem.brightness_from_penalty(ff.penalty)
 
     def initialize(self) -> None:
-        """Membentuk populasi awal (Base Position acak di [0, 1]^D)."""
+        """Inisialisasi populasi awal (Base Position acak di [0, 1]^D)."""
         self.rng = random.Random(self.seed)
         self.iteration = 0
         self.alpha = self.alpha_init
         self.fireflies = []
         self.last_movements = []
+        self.best_firefly = None
 
         dim = self.problem.dimension
         for i in range(self.n_fireflies):
@@ -325,7 +335,10 @@ class FireflyScheduler:
             brightness=ff.brightness,
             report=ff.report,
             last_attractor_id=ff.last_attractor_id,
+            last_distance_r=ff.last_distance_r,
             last_beta=ff.last_beta,
+            last_attract_mag=ff.last_attract_mag,
+            last_random_mag=ff.last_random_mag,
             last_step_mag=ff.last_step_mag,
             trail_2d=list(ff.trail_2d),
         )
@@ -337,179 +350,168 @@ class FireflyScheduler:
 
     def step(self) -> List[MovementRecord]:
         """
-        Menjalankan 1 iterasi Firefly Algorithm:
-        - Untuk setiap pasangan (i, j): jika brightness(j) > brightness(i),
-          firefly i bergerak mendekati j dengan daya tarik beta(r) + langkah acak alpha.
-        - Firefly paling terang melakukan eksplorasi lokal kecil (greedy: diterima bila membaik).
+        Menjalankan 1 iterasi Firefly Algorithm (synchronous snapshot):
+        1. Setiap firefly i mencari firefly j yang lebih terang (I_j > I_i)
+           dengan daya tarik efektif terbesar: beta(r_ij) * I_j.
+        2. Firefly i melangkah:
+           x_i_new = x_i + beta(r_ij) * (x_j - x_i) + alpha * epsilon_i
+        3. Firefly paling terang (tidak ada j yang lebih terang) melakukan
+           eksplorasi acak lokal (diterima secara greedy bila penalti tidak naik).
         """
         self.iteration += 1
         dim = self.problem.dimension
+        n = len(self.fireflies)
         movements: List[MovementRecord] = []
 
-        # Simpan snapshot posisi sebelum iterasi agar panah pergerakan jelas
-        for ff in self.fireflies:
-            ff.prev_position = list(ff.position)
-            ff.last_attractor_id = None
-            ff.last_beta = 0.0
-            ff.last_step_mag = 0.0
-
-        # Urutkan indeks berdasarkan brightness agar evaluasi stabil & jelas
-        n = len(self.fireflies)
-        # Temukan indeks firefly terbaik saat ini (paling terang)
-        best_idx = min(range(n), key=lambda idx: self.fireflies[idx].penalty)
+        # Snapshot posisi & brightness awal iterasi
+        old_positions = [list(ff.position) for ff in self.fireflies]
+        old_brightness = [ff.brightness for ff in self.fireflies]
 
         for i in range(n):
             ff_i = self.fireflies[i]
-            moved = False
+            ff_i.prev_position = list(old_positions[i])
+            penalty_before = ff_i.penalty
+            brightness_before = old_brightness[i]
 
-            # Cari semua j yang lebih terang dari i
-            # Untuk menjaga stabilitas dan memperlihatkan tarikan paling bermakna,
-            # ikuti standar FA: bandingkan i dengan setiap j yang lebih terang.
-            strongest_beta = -1.0
-            strongest_attractor: Optional[int] = None
-            accum_step_sq = 0.0
+            brighters = [j for j in range(n) if old_brightness[j] > brightness_before]
 
-            for j in range(n):
-                if i == j:
-                    continue
-                ff_j = self.fireflies[j]
-                if ff_j.brightness > ff_i.brightness:
-                    r = self._normalized_distance(ff_i.position, ff_j.position)
-                    beta = self.beta0 * math.exp(-self.gamma * (r ** 2))
+            if not brighters:
+                # Firefly paling terang: eksplorasi acak lokal (jika belum 0 penalti)
+                ff_i.last_attractor_id = ff_i.id
+                ff_i.last_distance_r = 0.0
+                ff_i.last_beta = 0.0
+                ff_i.last_attract_mag = 0.0
 
-                    penalty_before = ff_i.penalty
-                    brightness_before = ff_i.brightness
-
-                    new_pos = []
-                    attract_sq = 0.0
+                if ff_i.penalty > 0:
+                    cand = list(old_positions[i])
+                    k_dims = self.rng.randint(1, 3)
                     rand_sq = 0.0
-                    total_sq = 0.0
-
-                    for d in range(dim):
-                        attract_comp = beta * (ff_j.position[d] - ff_i.position[d])
-                        rand_comp = self.alpha * (self.rng.random() - 0.5)
-                        delta = attract_comp + rand_comp
-                        val = ff_i.position[d] + delta
-                        # Clamp ke [0, 1]
-                        val = max(0.0, min(1.0, val))
-                        actual_delta = val - ff_i.position[d]
-
-                        attract_sq += attract_comp ** 2
+                    for d in self.rng.sample(range(dim), k_dims):
+                        rand_comp = self.alpha * (self.rng.random() - 0.5) * 2.0
+                        cand[d] = max(0.0, min(1.0, cand[d] + rand_comp))
                         rand_sq += rand_comp ** 2
-                        total_sq += actual_delta ** 2
-                        new_pos.append(val)
 
-                    ff_i.position = new_pos
-                    self._evaluate_firefly(ff_i)
+                    cand_report = self.problem.evaluate(cand)
+                    if cand_report.total_penalty <= ff_i.penalty:
+                        step_mag = self.normalized_distance(old_positions[i], cand)
+                        rand_mag = math.sqrt(rand_sq / dim)
+                        ff_i.position = cand
+                        ff_i.report = cand_report
+                        ff_i.penalty = cand_report.total_penalty
+                        ff_i.brightness = self.problem.brightness_from_penalty(ff_i.penalty)
+                        ff_i.last_random_mag = rand_mag
+                        ff_i.last_step_mag = step_mag
 
-                    attract_mag = math.sqrt(attract_sq / dim)
-                    rand_mag = math.sqrt(rand_sq / dim)
-                    total_mag = math.sqrt(total_sq / dim)
-
-                    movements.append(
-                        MovementRecord(
-                            iteration=self.iteration,
-                            mover_id=ff_i.id,
-                            attractor_id=ff_j.id,
-                            mover_brightness_before=brightness_before,
-                            attractor_brightness=ff_j.brightness,
-                            distance_r=r,
-                            attractiveness_beta=beta,
-                            attraction_step_mag=attract_mag,
-                            random_step_mag=rand_mag,
-                            total_step_mag=total_mag,
-                            penalty_before=penalty_before,
-                            penalty_after=ff_i.penalty,
+                        movements.append(
+                            MovementRecord(
+                                iteration=self.iteration,
+                                mover_id=ff_i.id,
+                                attractor_id=ff_i.id,
+                                is_self_exploration=True,
+                                mover_brightness_before=brightness_before,
+                                attractor_brightness=ff_i.brightness,
+                                distance_r=0.0,
+                                attractiveness_beta=0.0,
+                                attraction_step_mag=0.0,
+                                random_step_mag=rand_mag,
+                                total_step_mag=step_mag,
+                                penalty_before=penalty_before,
+                                penalty_after=ff_i.penalty,
+                            )
                         )
-                    )
-
-                    if beta > strongest_beta:
-                        strongest_beta = beta
-                        strongest_attractor = ff_j.id
-                    accum_step_sq += total_mag ** 2
-                    moved = True
-
-            if moved:
-                ff_i.last_attractor_id = strongest_attractor
-                ff_i.last_beta = max(0.0, strongest_beta)
-                ff_i.last_step_mag = math.sqrt(accum_step_sq)
-            elif i == best_idx and ff_i.penalty > 0:
-                # Firefly paling terang mencoba 1 langkah eksplorasi lokal (greedy)
-                # agar tetap bisa keluar dari local optimum tanpa merusak solusi terbaik.
-                candidate = list(ff_i.position)
-                # Perturbasi terfokus pada mata kuliah yang masih konflik jika ada
-                conflict_courses = [
-                    c_idx
-                    for c_idx, reasons in (ff_i.report.conflicting_courses.items() if ff_i.report else [])
-                    if reasons
-                ]
-                if conflict_courses:
-                    target_c = self.rng.choice(conflict_courses)
-                    for offset in (0, 1):
-                        d = 2 * target_c + offset
-                        candidate[d] = max(0.0, min(1.0, candidate[d] + self.alpha * (self.rng.random() - 0.5) * 1.5))
+                    else:
+                        ff_i.last_random_mag = 0.0
+                        ff_i.last_step_mag = 0.0
                 else:
-                    for d in range(dim):
-                        candidate[d] = max(0.0, min(1.0, candidate[d] + self.alpha * (self.rng.random() - 0.5) * 0.5))
-
-                cand_report = self.problem.evaluate(candidate)
-                if cand_report.total_penalty <= ff_i.penalty:
-                    penalty_before = ff_i.penalty
-                    brightness_before = ff_i.brightness
-                    step_mag = self._normalized_distance(ff_i.position, candidate)
-                    ff_i.position = candidate
-                    ff_i.report = cand_report
-                    ff_i.penalty = cand_report.total_penalty
-                    ff_i.brightness = self.problem.brightness_from_penalty(ff_i.penalty)
-                    ff_i.last_attractor_id = ff_i.id  # self-exploration
-                    ff_i.last_beta = 0.0
-                    ff_i.last_step_mag = step_mag
-                    movements.append(
-                        MovementRecord(
-                            iteration=self.iteration,
-                            mover_id=ff_i.id,
-                            attractor_id=ff_i.id,
-                            mover_brightness_before=brightness_before,
-                            attractor_brightness=ff_i.brightness,
-                            distance_r=0.0,
-                            attractiveness_beta=0.0,
-                            attraction_step_mag=0.0,
-                            random_step_mag=step_mag,
-                            total_step_mag=step_mag,
-                            penalty_before=penalty_before,
-                            penalty_after=ff_i.penalty,
-                        )
+                    ff_i.last_random_mag = 0.0
+                    ff_i.last_step_mag = 0.0
+            else:
+                # Pilih attractor j yang paling menarik di mata firefly i
+                best_j = max(
+                    brighters,
+                    key=lambda j: self.compute_attractiveness(
+                        self.normalized_distance(old_positions[i], old_positions[j])
                     )
+                    * old_brightness[j],
+                )
+                r = self.normalized_distance(old_positions[i], old_positions[best_j])
+                beta = self.compute_attractiveness(r)
 
-            # Simpan jejak 2D (maksimal 25 titik terakhir supaya canvas tetap ringan)
+                new_pos: List[float] = []
+                attract_sq = 0.0
+                rand_sq = 0.0
+                total_sq = 0.0
+
+                for d in range(dim):
+                    attract_comp = beta * (old_positions[best_j][d] - old_positions[i][d])
+                    # Sparse random vector epsilon_i (~20% dimensi digoyang tiap step)
+                    eps = (self.rng.random() - 0.5) * 2.0 if self.rng.random() < 0.20 else 0.0
+                    rand_comp = self.alpha * eps
+                    val = max(0.0, min(1.0, old_positions[i][d] + attract_comp + rand_comp))
+                    actual_delta = val - old_positions[i][d]
+
+                    attract_sq += attract_comp ** 2
+                    rand_sq += rand_comp ** 2
+                    total_sq += actual_delta ** 2
+                    new_pos.append(val)
+
+                ff_i.position = new_pos
+                self._evaluate_firefly(ff_i)
+
+                attract_mag = math.sqrt(attract_sq / dim)
+                rand_mag = math.sqrt(rand_sq / dim)
+                total_mag = math.sqrt(total_sq / dim)
+
+                ff_i.last_attractor_id = best_j
+                ff_i.last_distance_r = r
+                ff_i.last_beta = beta
+                ff_i.last_attract_mag = attract_mag
+                ff_i.last_random_mag = rand_mag
+                ff_i.last_step_mag = total_mag
+
+                movements.append(
+                    MovementRecord(
+                        iteration=self.iteration,
+                        mover_id=ff_i.id,
+                        attractor_id=best_j,
+                        is_self_exploration=False,
+                        mover_brightness_before=brightness_before,
+                        attractor_brightness=old_brightness[best_j],
+                        distance_r=r,
+                        attractiveness_beta=beta,
+                        attraction_step_mag=attract_mag,
+                        random_step_mag=rand_mag,
+                        total_step_mag=total_mag,
+                        penalty_before=penalty_before,
+                        penalty_after=ff_i.penalty,
+                    )
+                )
+
+            # Simpan jejak 2D untuk visualisasi lintasan
             ff_i.trail_2d.append(self.project_2d(ff_i.position))
             if len(ff_i.trail_2d) > 25:
                 ff_i.trail_2d.pop(0)
 
-        # Elitisme ringan: pastikan firefly terbaik global tidak hilang
+        # Elitisme: pastikan solusi terbaik global tidak pernah hilang dari populasi
         self._update_best()
-        worst_idx = max(range(n), key=lambda idx: self.fireflies[idx].penalty)
         if self.best_firefly and all(f.penalty > self.best_firefly.penalty for f in self.fireflies):
+            worst_idx = max(range(n), key=lambda idx: self.fireflies[idx].penalty)
             el = self.fireflies[worst_idx]
             el.position = list(self.best_firefly.position)
             self._evaluate_firefly(el)
             el.trail_2d.append(self.project_2d(el.position))
 
-        # Peluruhan langkah acak alpha (damping)
-        self.alpha = max(0.01, self.alpha * self.alpha_decay)
+        # Peluruhan alpha (damping agar langkah acak mengecil di iterasi lanjut)
+        self.alpha = max(0.08, self.alpha * self.alpha_decay)
 
-        # Catat statistik iterasi
+        # Catat riwayat
         self.last_movements = movements
         self.best_penalty_history.append(self.best_firefly.penalty if self.best_firefly else 0)
         self.avg_penalty_history.append(self._avg_penalty())
 
-        if movements:
-            avg_beta = sum(m.attractiveness_beta for m in movements) / len(movements)
-            avg_step = sum(m.total_step_mag for m in movements) / len(movements)
-        else:
-            avg_beta = 0.0
-            avg_step = 0.0
-
+        non_self = [m for m in movements if not m.is_self_exploration]
+        avg_beta = sum(m.attractiveness_beta for m in non_self) / len(non_self) if non_self else 0.0
+        avg_step = sum(m.total_step_mag for m in movements) / len(movements) if movements else 0.0
         self.avg_beta_history.append(avg_beta)
         self.avg_step_history.append(avg_step)
         return movements
