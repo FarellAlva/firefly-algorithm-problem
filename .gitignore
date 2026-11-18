@@ -1,0 +1,13 @@
+# Laporan Word (.docx) tidak dimasukkan ke repository Git
+*.docx
+~$*.docx
+F_Laporan_Optimasi_Firefly_Algorithm_Penjadwalan_Farell_final.docx
+Laporan_Optimasi_Firefly_Algorithm_Penjadwalan_Farell_final.docx
+
+# Aset sementara pembangkit laporan
+report_assets/
+
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/

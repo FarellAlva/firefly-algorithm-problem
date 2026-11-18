@@ -1,24 +1,24 @@
 """
-Firefly Algorithm untuk Masalah Penjadwalan Mata Kuliah.
+Firefly Algorithm untuk Penjadwalan 4 Tugas pada 1 Mesin (Anti-Overlap & Anti-Telat).
 Pure Python standard library (tanpa dependensi eksternal).
 
-Konsep inti yang dimodelkan:
+Model Opsi 2 (Kontinu 4 Dimensi — Sangat Intuitif):
 1. Base Position (x_i):
-   Vektor posisi kontinu dalam [0, 1]^(2*M), di mana M adalah jumlah mata kuliah.
-   Setiap mata kuliah k memiliki 2 koordinat:
-   - x[2k]     -> dipetakan ke Slot Waktu (0..num_slots-1)
-   - x[2k + 1] -> dipetakan ke Ruangan (0..num_rooms-1)
-2. Light Intensity / Brightness (I_i):
-   I(x_i) = 1 / (1 + Penalty(x_i))
-   Semakin kecil penalti bentrok jadwal, semakin terang kunang-kunang.
-3. Attractiveness (beta):
+   Vektor 4 angka kontinu [t_1, t_2, t_3, t_4] yang LANGSUNG menyatakan
+   jam mulai masing-masing tugas (T1..T4) dalam jam operasional 08:00 - 17:00.
+2. Evaluasi Penalti (Cost f(x)):
+   Hanya 2 aturan sederhana:
+   - Overlap (bentrok waktu di 1 mesin)  : bobot 10.0 per jam tumpang tindih
+   - Lateness (melewati deadline tugas)  : bobot  6.0 per jam keterlambatan
+   Total Penalti: f(x) = 10.0 * Overlap + 6.0 * Lateness
+3. Light Intensity / Brightness (I):
+   I(x_i) = 1 / (1 + f(x_i))
+   Penalti = 0.00 -> I = 1.0000 (paling terang / jadwal optimal).
+4. Attractiveness (beta):
    beta(r) = beta0 * exp(-gamma * r^2)
-   Dengan r = ||x_i - x_j|| / sqrt(D) adalah jarak Euclidean ternormalisasi di [0, 1].
-4. Steps / Movement (Delta x):
-   x_i_new = x_i + beta(r) * (x_j - x_i) + alpha * epsilon_i
-   Terdiri dari:
-   - Attraction step : tarikan menuju kunang-kunang yang lebih terang (eksploitasi)
-   - Random step     : langkah acak jarang (sparse) terkendali oleh alpha (eksplorasi)
+   dengan r = jarak Euclidean ternormalisasi di [0, 1].
+5. Steps / Movement (Delta x):
+   t_new = t_old + beta(r) * (t_j - t_i) + alpha * (rand - 0.5) * span
 """
 
 from __future__ import annotations
@@ -29,42 +29,66 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 
+WORK_START = 8.0   # 08:00
+WORK_END = 17.0    # 17:00
+
+
+def format_hour(hour_float: float) -> str:
+    """Mengubah jam desimal (misal 10.5) menjadi format HH:MM ('10:30')."""
+    total_minutes = int(round(hour_float * 60))
+    hh = total_minutes // 60
+    mm = total_minutes % 60
+    return f"{hh:02d}:{mm:02d}"
+
+
 @dataclass(frozen=True)
-class Course:
+class Task:
     code: str
     name: str
-    lecturer: str
-    student_group: str
-    students: int
+    duration: float     # jam
+    ready_time: float   # jam paling awal boleh mulai
+    deadline: float     # jam maksimal harus selesai
+    color: str          # warna balok di Gantt Chart
 
+    @property
+    def min_start(self) -> float:
+        return self.ready_time
 
-@dataclass(frozen=True)
-class Room:
-    code: str
-    name: str
-    capacity: int
+    @property
+    def max_start(self) -> float:
+        return WORK_END - self.duration
 
-
-@dataclass(frozen=True)
-class TimeSlot:
-    index: int
-    day: str
-    session: str
-    label: str
+    @property
+    def span(self) -> float:
+        return max(0.5, self.max_start - self.min_start)
 
 
 @dataclass
-class ConflictReport:
-    room_conflicts: int
-    lecturer_conflicts: int
-    group_conflicts: int
-    capacity_violations: int
-    total_penalty: int
-    conflicting_courses: Dict[int, List[str]]  # course_idx -> alasan konflik
+class TaskStatus:
+    task_index: int
+    start: float
+    end: float
+    overlap_hours: float
+    lateness_hours: float
+    overlaps_with: List[str]
 
     @property
-    def hard_conflicts(self) -> int:
-        return self.room_conflicts + self.lecturer_conflicts + self.group_conflicts
+    def is_valid(self) -> bool:
+        return self.overlap_hours < 1e-4 and self.lateness_hours < 1e-4
+
+
+@dataclass
+class ScheduleReport:
+    total_overlap_hours: float
+    total_lateness_hours: float
+    overlap_pairs: int
+    late_tasks: int
+    total_penalty: float
+    task_statuses: List[TaskStatus]
+
+    @property
+    def is_optimal(self) -> bool:
+        return self.total_penalty < 0.05
 
 
 @dataclass
@@ -79,174 +103,130 @@ class MovementRecord:
     attractor_brightness: float
     distance_r: float
     attractiveness_beta: float
-    attraction_step_mag: float
-    random_step_mag: float
-    total_step_mag: float
-    penalty_before: int
-    penalty_after: int
+    attraction_step_hours: float
+    random_step_hours: float
+    total_step_hours: float
+    penalty_before: float
+    penalty_after: float
 
 
 @dataclass
 class Firefly:
     id: int
-    base_position: List[float]  # posisi awal (iterasi 0)
-    position: List[float]       # posisi saat ini
-    prev_position: List[float]  # posisi sebelum step terakhir
-    penalty: int = 0
+    base_position: List[float]  # [t1, t2, t3, t4] pada iterasi 0
+    position: List[float]       # [t1, t2, t3, t4] saat ini
+    prev_position: List[float]  # [t1, t2, t3, t4] sebelum step terakhir
+    penalty: float = 0.0
     brightness: float = 0.0
-    report: Optional[ConflictReport] = None
+    report: Optional[ScheduleReport] = None
     last_attractor_id: Optional[int] = None
     last_distance_r: float = 0.0
     last_beta: float = 0.0
-    last_attract_mag: float = 0.0
-    last_random_mag: float = 0.0
-    last_step_mag: float = 0.0
+    last_step_hours: float = 0.0
     trail_2d: List[Tuple[float, float]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
-# Dataset Penjadwalan Default (10 Mata Kuliah, 6 Slot Waktu, 3 Ruangan)
+# Dataset Default: 4 Tugas Produksi pada 1 Mesin (Jam Kerja 08:00 - 17:00)
+# Total durasi = 2.0 + 1.5 + 2.5 + 1.5 = 7.5 jam (jendela kerja 9.0 jam)
 # ---------------------------------------------------------------------------
 
-DEFAULT_COURSES: List[Course] = [
-    Course("MK01", "Algoritma & Pemrog.", "Dr. Andi", "TI-A", 35),
-    Course("MK02", "Struktur Data", "Dr. Andi", "TI-B", 30),
-    Course("MK03", "Basis Data", "Bu Sari", "TI-A", 35),
-    Course("MK04", "Kecerdasan Buatan", "Bu Sari", "TI-C", 25),
-    Course("MK05", "Jaringan Komputer", "Pak Budi", "TI-B", 30),
-    Course("MK06", "Sistem Operasi", "Pak Budi", "TI-C", 25),
-    Course("MK07", "Rekayasa PL", "Dr. Citra", "TI-A", 35),
-    Course("MK08", "Pemrograman Web", "Dr. Citra", "TI-B", 30),
-    Course("MK09", "Bio-Computing", "Pak Dimas", "TI-C", 25),
-    Course("MK10", "Keamanan Siber", "Pak Dimas", "TI-A", 35),
-]
-
-DEFAULT_ROOMS: List[Room] = [
-    Room("R1", "Ruang Besar A (Kap 40)", 40),
-    Room("R2", "Ruang Sedang B (Kap 32)", 32),
-    Room("R3", "Lab Komputer C (Kap 28)", 28),
-]
-
-DEFAULT_SLOTS: List[TimeSlot] = [
-    TimeSlot(0, "Senin", "Pagi", "Senin 08:00"),
-    TimeSlot(1, "Senin", "Siang", "Senin 13:00"),
-    TimeSlot(2, "Selasa", "Pagi", "Selasa 08:00"),
-    TimeSlot(3, "Selasa", "Siang", "Selasa 13:00"),
-    TimeSlot(4, "Rabu", "Pagi", "Rabu 08:00"),
-    TimeSlot(5, "Rabu", "Siang", "Rabu 13:00"),
+DEFAULT_TASKS: List[Task] = [
+    Task("T1", "Pemotongan Rangka", 2.0, 8.0, 12.0, "#3b82f6"),
+    Task("T2", "Perakitan Komponen", 1.5, 8.0, 13.5, "#8b5cf6"),
+    Task("T3", "Kalibrasi & Uji Beban", 2.5, 9.0, 16.0, "#06b6d4"),
+    Task("T4", "Finishing & Packing", 1.5, 10.0, 17.0, "#10b981"),
 ]
 
 
-class SchedulingProblem:
-    """Representasi masalah penjadwalan mata kuliah & fungsi evaluasi penalti."""
+class JobSchedulingProblem:
+    """Masalah penjadwalan 4 tugas di 1 mesin: anti-overlap & anti-telat."""
 
-    HARD_PENALTY = 10
-    SOFT_CAPACITY_PENALTY = 3
+    OVERLAP_WEIGHT = 10.0   # penalti per jam tumpang tindih
+    LATENESS_WEIGHT = 6.0   # penalti per jam melewati deadline
 
-    def __init__(
-        self,
-        courses: Optional[List[Course]] = None,
-        rooms: Optional[List[Room]] = None,
-        slots: Optional[List[TimeSlot]] = None,
-    ) -> None:
-        self.courses = courses or list(DEFAULT_COURSES)
-        self.rooms = rooms or list(DEFAULT_ROOMS)
-        self.slots = slots or list(DEFAULT_SLOTS)
-        self.dimension = 2 * len(self.courses)
+    def __init__(self, tasks: Optional[List[Task]] = None) -> None:
+        self.tasks = tasks or list(DEFAULT_TASKS)
+        self.dimension = len(self.tasks)
 
-    def decode(self, position: List[float]) -> List[Tuple[int, int]]:
-        """
-        Mengubah vektor posisi kontinu [0, 1]^(2*M) menjadi daftar
-        (slot_idx, room_idx) untuk setiap mata kuliah.
-        """
-        num_slots = len(self.slots)
-        num_rooms = len(self.rooms)
-        assignments: List[Tuple[int, int]] = []
-        for k in range(len(self.courses)):
-            val_slot = max(0.0, min(0.999999, position[2 * k]))
-            val_room = max(0.0, min(0.999999, position[2 * k + 1]))
-            slot_idx = int(val_slot * num_slots)
-            room_idx = int(val_room * num_rooms)
-            assignments.append((slot_idx, room_idx))
-        return assignments
+    def clamp(self, position: List[float]) -> List[float]:
+        clamped: List[float] = []
+        for val, task in zip(position, self.tasks):
+            clamped.append(max(task.min_start, min(task.max_start, val)))
+        return clamped
 
-    def evaluate(self, position: List[float]) -> ConflictReport:
-        """Menghitung seluruh pelanggaran jadwal (Hard + Soft constraints)."""
-        assignments = self.decode(position)
-        room_slot_map: Dict[Tuple[int, int], List[int]] = {}
-        lecturer_slot_map: Dict[Tuple[str, int], List[int]] = {}
-        group_slot_map: Dict[Tuple[str, int], List[int]] = {}
-        conflicting: Dict[int, List[str]] = {i: [] for i in range(len(self.courses))}
+    def evaluate(self, position: List[float]) -> ScheduleReport:
+        n = len(self.tasks)
+        starts = list(position)
+        ends = [starts[k] + self.tasks[k].duration for k in range(n)]
 
-        capacity_violations = 0
+        overlap_per_task = [0.0] * n
+        overlap_names: List[List[str]] = [[] for _ in range(n)]
+        total_overlap = 0.0
+        overlap_pairs = 0
 
-        for idx, (slot_idx, room_idx) in enumerate(assignments):
-            course = self.courses[idx]
-            room = self.rooms[room_idx]
+        for a in range(n):
+            for b in range(a + 1, n):
+                ov = min(ends[a], ends[b]) - max(starts[a], starts[b])
+                if ov > 1e-4:
+                    total_overlap += ov
+                    overlap_pairs += 1
+                    overlap_per_task[a] += ov
+                    overlap_per_task[b] += ov
+                    overlap_names[a].append(self.tasks[b].code)
+                    overlap_names[b].append(self.tasks[a].code)
 
-            room_slot_map.setdefault((slot_idx, room_idx), []).append(idx)
-            lecturer_slot_map.setdefault((course.lecturer, slot_idx), []).append(idx)
-            group_slot_map.setdefault((course.student_group, slot_idx), []).append(idx)
+        total_lateness = 0.0
+        late_tasks = 0
+        statuses: List[TaskStatus] = []
 
-            if course.students > room.capacity:
-                capacity_violations += 1
-                conflicting[idx].append(
-                    f"Kapasitas {room.code} ({room.capacity}) < {course.students}"
+        for k in range(n):
+            late = max(0.0, ends[k] - self.tasks[k].deadline)
+            if late > 1e-4:
+                total_lateness += late
+                late_tasks += 1
+            statuses.append(
+                TaskStatus(
+                    task_index=k,
+                    start=starts[k],
+                    end=ends[k],
+                    overlap_hours=overlap_per_task[k],
+                    lateness_hours=late,
+                    overlaps_with=overlap_names[k],
                 )
-
-        room_conflicts = 0
-        for (_slot_idx, room_idx), c_indices in room_slot_map.items():
-            if len(c_indices) > 1:
-                room_conflicts += len(c_indices) - 1
-                for ci in c_indices:
-                    conflicting[ci].append(f"Bentrok Ruang {self.rooms[room_idx].code}")
-
-        lecturer_conflicts = 0
-        for (lecturer, _slot_idx), c_indices in lecturer_slot_map.items():
-            if len(c_indices) > 1:
-                lecturer_conflicts += len(c_indices) - 1
-                for ci in c_indices:
-                    conflicting[ci].append(f"Bentrok Dosen ({lecturer})")
-
-        group_conflicts = 0
-        for (group, _slot_idx), c_indices in group_slot_map.items():
-            if len(c_indices) > 1:
-                group_conflicts += len(c_indices) - 1
-                for ci in c_indices:
-                    conflicting[ci].append(f"Bentrok Kelas ({group})")
+            )
 
         total_penalty = (
-            (room_conflicts + lecturer_conflicts + group_conflicts) * self.HARD_PENALTY
-            + capacity_violations * self.SOFT_CAPACITY_PENALTY
+            self.OVERLAP_WEIGHT * total_overlap + self.LATENESS_WEIGHT * total_lateness
         )
-        return ConflictReport(
-            room_conflicts=room_conflicts,
-            lecturer_conflicts=lecturer_conflicts,
-            group_conflicts=group_conflicts,
-            capacity_violations=capacity_violations,
+        return ScheduleReport(
+            total_overlap_hours=total_overlap,
+            total_lateness_hours=total_lateness,
+            overlap_pairs=overlap_pairs,
+            late_tasks=late_tasks,
             total_penalty=total_penalty,
-            conflicting_courses=conflicting,
+            task_statuses=statuses,
         )
 
     @staticmethod
-    def brightness_from_penalty(penalty: int) -> float:
+    def brightness_from_penalty(penalty: float) -> float:
         return 1.0 / (1.0 + penalty)
 
 
-class FireflyScheduler:
-    """Mesin Firefly Algorithm untuk optimasi penjadwalan."""
+class FireflyJobScheduler:
+    """Mesin Firefly Algorithm kontinu 4D untuk penjadwalan 4 tugas."""
 
     def __init__(
         self,
-        problem: Optional[SchedulingProblem] = None,
-        n_fireflies: int = 25,
+        problem: Optional[JobSchedulingProblem] = None,
+        n_fireflies: int = 20,
         beta0: float = 1.0,
         gamma: float = 1.5,
-        alpha: float = 0.60,
-        alpha_decay: float = 0.985,
+        alpha: float = 0.35,
+        alpha_decay: float = 0.96,
         seed: int = 42,
     ) -> None:
-        self.problem = problem or SchedulingProblem()
+        self.problem = problem or JobSchedulingProblem()
         self.n_fireflies = n_fireflies
         self.beta0 = beta0
         self.gamma = gamma
@@ -260,8 +240,7 @@ class FireflyScheduler:
         self.fireflies: List[Firefly] = []
         self.best_firefly: Optional[Firefly] = None
 
-        # Riwayat statistik per iterasi
-        self.best_penalty_history: List[int] = []
+        self.best_penalty_history: List[float] = []
         self.avg_penalty_history: List[float] = []
         self.avg_beta_history: List[float] = []
         self.avg_step_history: List[float] = []
@@ -269,33 +248,60 @@ class FireflyScheduler:
 
         self.initialize()
 
-    def project_2d(self, position: List[float]) -> Tuple[float, float]:
-        """
-        Proyeksi deterministik 2D dari vektor 2M-dimensi untuk visualisasi Canvas:
-        - Sumbu X: rata-rata koordinat slot waktu (indeks genap)
-        - Sumbu Y: rata-rata koordinat ruangan (indeks ganjil)
-        """
-        xs = position[0::2]
-        ys = position[1::2]
-        return (sum(xs) / len(xs), sum(ys) / len(ys))
-
-    @staticmethod
-    def normalized_distance(pos_a: List[float], pos_b: List[float]) -> float:
-        sq = sum((a - b) ** 2 for a, b in zip(pos_a, pos_b))
-        return math.sqrt(sq / len(pos_a))
+    def normalized_distance(self, pos_a: List[float], pos_b: List[float]) -> float:
+        """Jarak Euclidean ternormalisasi ke [0, 1] berdasarkan span tiap tugas."""
+        sq = 0.0
+        for a, b, task in zip(pos_a, pos_b, self.problem.tasks):
+            diff = (a - b) / task.span
+            sq += diff * diff
+        return math.sqrt(sq / len(self.problem.tasks))
 
     def compute_attractiveness(self, r: float) -> float:
-        """Rumus Attractiveness Firefly Algorithm: beta(r) = beta0 * exp(-gamma * r^2)."""
+        """Rumus Attractiveness FA: beta(r) = beta0 * exp(-gamma * r^2)."""
         return self.beta0 * math.exp(-self.gamma * (r ** 2))
 
+    def project_2d(self, position: List[float]) -> Tuple[float, float]:
+        """
+        Proyeksi 2D intuitif untuk Canvas Firefly:
+        - Sumbu X: rata-rata jam mulai Tugas Awal (T1 & T2)
+        - Sumbu Y: rata-rata jam mulai Tugas Lanjut (T3 & T4)
+        """
+        x_val = 0.5 * (position[0] + position[1])
+        y_val = 0.5 * (position[2] + position[3])
+        return (x_val, y_val)
+
     def _evaluate_firefly(self, ff: Firefly) -> None:
-        report = self.problem.evaluate(ff.position)
-        ff.report = report
-        ff.penalty = report.total_penalty
+        rep = self.problem.evaluate(ff.position)
+        ff.report = rep
+        ff.penalty = rep.total_penalty
         ff.brightness = self.problem.brightness_from_penalty(ff.penalty)
 
+    def _clone_firefly(self, ff: Firefly) -> Firefly:
+        return Firefly(
+            id=ff.id,
+            base_position=list(ff.base_position),
+            position=list(ff.position),
+            prev_position=list(ff.prev_position),
+            penalty=ff.penalty,
+            brightness=ff.brightness,
+            report=ff.report,
+            last_attractor_id=ff.last_attractor_id,
+            last_distance_r=ff.last_distance_r,
+            last_beta=ff.last_beta,
+            last_step_hours=ff.last_step_hours,
+            trail_2d=list(ff.trail_2d),
+        )
+
+    def _update_best(self) -> None:
+        current_best = min(self.fireflies, key=lambda f: f.penalty)
+        if self.best_firefly is None or current_best.penalty <= self.best_firefly.penalty:
+            self.best_firefly = self._clone_firefly(current_best)
+
+    def _avg_penalty(self) -> float:
+        return sum(f.penalty for f in self.fireflies) / len(self.fireflies)
+
     def initialize(self) -> None:
-        """Inisialisasi populasi awal (Base Position acak di [0, 1]^D)."""
+        """Membentuk Base Position acak [t1, t2, t3, t4] pada iterasi 0."""
         self.rng = random.Random(self.seed)
         self.iteration = 0
         self.alpha = self.alpha_init
@@ -303,9 +309,11 @@ class FireflyScheduler:
         self.last_movements = []
         self.best_firefly = None
 
-        dim = self.problem.dimension
         for i in range(self.n_fireflies):
-            base_pos = [self.rng.random() for _ in range(dim)]
+            base_pos = [
+                task.min_start + self.rng.random() * task.span
+                for task in self.problem.tasks
+            ]
             ff = Firefly(
                 id=i,
                 base_position=list(base_pos),
@@ -322,111 +330,76 @@ class FireflyScheduler:
         self.avg_beta_history = [0.0]
         self.avg_step_history = [0.0]
 
-    def _avg_penalty(self) -> float:
-        return sum(f.penalty for f in self.fireflies) / len(self.fireflies)
-
-    def _clone_firefly(self, ff: Firefly) -> Firefly:
-        return Firefly(
-            id=ff.id,
-            base_position=list(ff.base_position),
-            position=list(ff.position),
-            prev_position=list(ff.prev_position),
-            penalty=ff.penalty,
-            brightness=ff.brightness,
-            report=ff.report,
-            last_attractor_id=ff.last_attractor_id,
-            last_distance_r=ff.last_distance_r,
-            last_beta=ff.last_beta,
-            last_attract_mag=ff.last_attract_mag,
-            last_random_mag=ff.last_random_mag,
-            last_step_mag=ff.last_step_mag,
-            trail_2d=list(ff.trail_2d),
-        )
-
-    def _update_best(self) -> None:
-        current_best = min(self.fireflies, key=lambda f: f.penalty)
-        if self.best_firefly is None or current_best.penalty <= self.best_firefly.penalty:
-            self.best_firefly = self._clone_firefly(current_best)
-
     def step(self) -> List[MovementRecord]:
         """
-        Menjalankan 1 iterasi Firefly Algorithm (synchronous snapshot):
-        1. Setiap firefly i mencari firefly j yang lebih terang (I_j > I_i)
-           dengan daya tarik efektif terbesar: beta(r_ij) * I_j.
-        2. Firefly i melangkah:
-           x_i_new = x_i + beta(r_ij) * (x_j - x_i) + alpha * epsilon_i
-        3. Firefly paling terang (tidak ada j yang lebih terang) melakukan
-           eksplorasi acak lokal (diterima secara greedy bila penalti tidak naik).
+        Menjalankan 1 iterasi Firefly Algorithm:
+        - Setiap firefly i mencari penarik j yang lebih terang (I_j > I_i)
+          dengan daya tarik efektif beta(r_ij) * I_j terbesar.
+        - Posisi jam mulai diperbarui:
+          t_new = t_old + beta(r) * (t_j - t_i) + alpha * (rand - 0.5) * span
+        - Firefly paling terang melakukan eksplorasi lokal kecil (greedy).
         """
         self.iteration += 1
-        dim = self.problem.dimension
         n = len(self.fireflies)
+        dim = self.problem.dimension
         movements: List[MovementRecord] = []
 
-        # Snapshot posisi & brightness awal iterasi
         old_positions = [list(ff.position) for ff in self.fireflies]
         old_brightness = [ff.brightness for ff in self.fireflies]
 
         for i in range(n):
             ff_i = self.fireflies[i]
             ff_i.prev_position = list(old_positions[i])
-            penalty_before = ff_i.penalty
-            brightness_before = old_brightness[i]
+            pen_before = ff_i.penalty
+            bri_before = old_brightness[i]
 
-            brighters = [j for j in range(n) if old_brightness[j] > brightness_before]
+            brighters = [j for j in range(n) if old_brightness[j] > bri_before + 1e-9]
 
             if not brighters:
-                # Firefly paling terang: eksplorasi acak lokal (jika belum 0 penalti)
                 ff_i.last_attractor_id = ff_i.id
                 ff_i.last_distance_r = 0.0
                 ff_i.last_beta = 0.0
-                ff_i.last_attract_mag = 0.0
 
-                if ff_i.penalty > 0:
+                if ff_i.penalty >= 0.05:
                     cand = list(old_positions[i])
-                    k_dims = self.rng.randint(1, 3)
                     rand_sq = 0.0
-                    for d in self.rng.sample(range(dim), k_dims):
-                        rand_comp = self.alpha * (self.rng.random() - 0.5) * 2.0
-                        cand[d] = max(0.0, min(1.0, cand[d] + rand_comp))
-                        rand_sq += rand_comp ** 2
-
-                    cand_report = self.problem.evaluate(cand)
-                    if cand_report.total_penalty <= ff_i.penalty:
-                        step_mag = self.normalized_distance(old_positions[i], cand)
-                        rand_mag = math.sqrt(rand_sq / dim)
+                    for d, task in enumerate(self.problem.tasks):
+                        rc = self.alpha * (self.rng.random() - 0.5) * task.span * 0.6
+                        cand[d] = max(task.min_start, min(task.max_start, cand[d] + rc))
+                        rand_sq += rc * rc
+                    cand_rep = self.problem.evaluate(cand)
+                    if cand_rep.total_penalty <= ff_i.penalty:
+                        tot_hr = math.sqrt(
+                            sum((cand[d] - old_positions[i][d]) ** 2 for d in range(dim)) / dim
+                        )
+                        rnd_hr = math.sqrt(rand_sq / dim)
                         ff_i.position = cand
-                        ff_i.report = cand_report
-                        ff_i.penalty = cand_report.total_penalty
+                        ff_i.report = cand_rep
+                        ff_i.penalty = cand_rep.total_penalty
                         ff_i.brightness = self.problem.brightness_from_penalty(ff_i.penalty)
-                        ff_i.last_random_mag = rand_mag
-                        ff_i.last_step_mag = step_mag
-
+                        ff_i.last_step_hours = tot_hr
                         movements.append(
                             MovementRecord(
                                 iteration=self.iteration,
                                 mover_id=ff_i.id,
                                 attractor_id=ff_i.id,
                                 is_self_exploration=True,
-                                mover_brightness_before=brightness_before,
+                                mover_brightness_before=bri_before,
                                 attractor_brightness=ff_i.brightness,
                                 distance_r=0.0,
                                 attractiveness_beta=0.0,
-                                attraction_step_mag=0.0,
-                                random_step_mag=rand_mag,
-                                total_step_mag=step_mag,
-                                penalty_before=penalty_before,
+                                attraction_step_hours=0.0,
+                                random_step_hours=rnd_hr,
+                                total_step_hours=tot_hr,
+                                penalty_before=pen_before,
                                 penalty_after=ff_i.penalty,
                             )
                         )
                     else:
-                        ff_i.last_random_mag = 0.0
-                        ff_i.last_step_mag = 0.0
+                        ff_i.last_step_hours = 0.0
                 else:
-                    ff_i.last_random_mag = 0.0
-                    ff_i.last_step_mag = 0.0
+                    ff_i.last_step_hours = 0.0
             else:
-                # Pilih attractor j yang paling menarik di mata firefly i
                 best_j = max(
                     brighters,
                     key=lambda j: self.compute_attractiveness(
@@ -438,36 +411,34 @@ class FireflyScheduler:
                 beta = self.compute_attractiveness(r)
 
                 new_pos: List[float] = []
-                attract_sq = 0.0
-                rand_sq = 0.0
-                total_sq = 0.0
+                att_sq = 0.0
+                rnd_sq = 0.0
+                tot_sq = 0.0
 
-                for d in range(dim):
-                    attract_comp = beta * (old_positions[best_j][d] - old_positions[i][d])
-                    # Sparse random vector epsilon_i (~20% dimensi digoyang tiap step)
-                    eps = (self.rng.random() - 0.5) * 2.0 if self.rng.random() < 0.20 else 0.0
-                    rand_comp = self.alpha * eps
-                    val = max(0.0, min(1.0, old_positions[i][d] + attract_comp + rand_comp))
-                    actual_delta = val - old_positions[i][d]
-
-                    attract_sq += attract_comp ** 2
-                    rand_sq += rand_comp ** 2
-                    total_sq += actual_delta ** 2
+                for d, task in enumerate(self.problem.tasks):
+                    att_comp = beta * (old_positions[best_j][d] - old_positions[i][d])
+                    rnd_comp = self.alpha * (self.rng.random() - 0.5) * task.span
+                    val = max(
+                        task.min_start,
+                        min(task.max_start, old_positions[i][d] + att_comp + rnd_comp),
+                    )
+                    actual = val - old_positions[i][d]
+                    att_sq += att_comp * att_comp
+                    rnd_sq += rnd_comp * rnd_comp
+                    tot_sq += actual * actual
                     new_pos.append(val)
 
                 ff_i.position = new_pos
                 self._evaluate_firefly(ff_i)
 
-                attract_mag = math.sqrt(attract_sq / dim)
-                rand_mag = math.sqrt(rand_sq / dim)
-                total_mag = math.sqrt(total_sq / dim)
+                att_hr = math.sqrt(att_sq / dim)
+                rnd_hr = math.sqrt(rnd_sq / dim)
+                tot_hr = math.sqrt(tot_sq / dim)
 
                 ff_i.last_attractor_id = best_j
                 ff_i.last_distance_r = r
                 ff_i.last_beta = beta
-                ff_i.last_attract_mag = attract_mag
-                ff_i.last_random_mag = rand_mag
-                ff_i.last_step_mag = total_mag
+                ff_i.last_step_hours = tot_hr
 
                 movements.append(
                     MovementRecord(
@@ -475,43 +446,41 @@ class FireflyScheduler:
                         mover_id=ff_i.id,
                         attractor_id=best_j,
                         is_self_exploration=False,
-                        mover_brightness_before=brightness_before,
+                        mover_brightness_before=bri_before,
                         attractor_brightness=old_brightness[best_j],
                         distance_r=r,
                         attractiveness_beta=beta,
-                        attraction_step_mag=attract_mag,
-                        random_step_mag=rand_mag,
-                        total_step_mag=total_mag,
-                        penalty_before=penalty_before,
+                        attraction_step_hours=att_hr,
+                        random_step_hours=rnd_hr,
+                        total_step_hours=tot_hr,
+                        penalty_before=pen_before,
                         penalty_after=ff_i.penalty,
                     )
                 )
 
-            # Simpan jejak 2D untuk visualisasi lintasan
             ff_i.trail_2d.append(self.project_2d(ff_i.position))
             if len(ff_i.trail_2d) > 25:
                 ff_i.trail_2d.pop(0)
 
-        # Elitisme: pastikan solusi terbaik global tidak pernah hilang dari populasi
+        # Elitisme ringan
         self._update_best()
-        if self.best_firefly and all(f.penalty > self.best_firefly.penalty for f in self.fireflies):
+        if self.best_firefly and all(f.penalty > self.best_firefly.penalty + 1e-9 for f in self.fireflies):
             worst_idx = max(range(n), key=lambda idx: self.fireflies[idx].penalty)
             el = self.fireflies[worst_idx]
             el.position = list(self.best_firefly.position)
             self._evaluate_firefly(el)
             el.trail_2d.append(self.project_2d(el.position))
 
-        # Peluruhan alpha (damping agar langkah acak mengecil di iterasi lanjut)
-        self.alpha = max(0.08, self.alpha * self.alpha_decay)
+        # Peluruhan alpha
+        self.alpha = max(0.02, self.alpha * self.alpha_decay)
 
-        # Catat riwayat
         self.last_movements = movements
-        self.best_penalty_history.append(self.best_firefly.penalty if self.best_firefly else 0)
+        self.best_penalty_history.append(self.best_firefly.penalty if self.best_firefly else 0.0)
         self.avg_penalty_history.append(self._avg_penalty())
 
         non_self = [m for m in movements if not m.is_self_exploration]
         avg_beta = sum(m.attractiveness_beta for m in non_self) / len(non_self) if non_self else 0.0
-        avg_step = sum(m.total_step_mag for m in movements) / len(movements) if movements else 0.0
+        avg_step = sum(m.total_step_hours for m in movements) / len(movements) if movements else 0.0
         self.avg_beta_history.append(avg_beta)
         self.avg_step_history.append(avg_step)
         return movements
