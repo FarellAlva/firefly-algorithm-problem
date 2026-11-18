@@ -126,11 +126,6 @@ class Firefly:
     trail_2d: List[Tuple[float, float]] = field(default_factory=list)
 
 
-# ---------------------------------------------------------------------------
-# Dataset Default: 4 Tugas Produksi pada 1 Mesin (Jam Kerja 08:00 - 17:00)
-# Total durasi = 2.0 + 1.5 + 2.5 + 1.5 = 7.5 jam (jendela kerja 9.0 jam)
-# ---------------------------------------------------------------------------
-
 DEFAULT_TASKS: List[Task] = [
     Task("T1", "Pemotongan Rangka", 2.0, 8.0, 12.0, "#3b82f6"),
     Task("T2", "Perakitan Komponen", 1.5, 8.0, 13.5, "#8b5cf6"),
